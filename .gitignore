@@ -9,3 +9,10 @@ question_cache.pkl
 __pycache__/
 *.pyc
 .streamlit/secrets.toml
+users.json
+shared_questions.json
+student_history.json
+question_cache.pkl
+.env
+__pycache__/
+*.pyc
