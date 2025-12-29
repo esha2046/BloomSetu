@@ -1,48 +1,137 @@
-def eval_mcq(ques,ans):
-    correct = (ans==ques['correct_answer'])
+def evaluate_answer(question, student_answer):
+    if 'options' in question:
+        return evaluate_mcq(question, student_answer)
+    else:
+        return evaluate_descriptive(question, student_answer)
+
+#simple mcq logic
+def evaluate_mcq(question, student_answer):
+    correct_answer = question['correct_answer']
+    marks = question.get('marks', 1)
+    is_correct = (student_answer == correct_answer)
+    
     return {
-        'correct': correct,
-        'score': 10 if correct else 0,
-        'feedback': ques['explanation'] if not correct else f"Correct! {ques['explanation']}"
+        'correct': is_correct,
+        'score': marks if is_correct else 0,
+        'max_score': marks,
+        'percentage': 100 if is_correct else 0,
+        'feedback': (question['explanation'] if is_correct 
+                    else f"Correct answer: {correct_answer}. {question['explanation']}")
     }
 
-def eval_shortans(ques,ans):
-    if not ans or len(ans.strip())<10:
-        return{
-            'score':0,
+def evaluate_descriptive(question, student_answer):
+    if not student_answer or len(student_answer.strip()) < 10:
+        return {
+            'score': 0,
+            'max_score': question.get('marks', 5),
+            'percentage': 0,
+            'feedback': "Answer too short or empty",
             'matched_points': [],
-            'missing_points': ques['key_points'],
-            'feedback': "Answer too short. Please provide more detail."
+            'missing_points': question.get('key_points', []),
+            'word_count': 0
         }
     
-    ans_lower = ans.lower()
-    matched = []
-    missing = []
-
-    for point in ques['key_points']:
-        keywords = [w.lower() for w in point.split() if len(w) > 4] #we only keep meaningful words from sentence
-        if any(word in ans_lower for word in keywords):
-            matched.append(point)
+    max_marks = question.get('marks', 5)
+    key_points = question.get('key_points', [])
+    word_count = len(student_answer.split())
+    
+    student_lower = student_answer.lower()
+    matched_points = []
+    missing_points = []
+    
+    for point in key_points:
+        keywords = extract_keywords(point)
+        matches = sum(1 for kw in keywords if kw in student_lower)
+        
+        if matches >= 2 or len(keywords) <= 2:
+            matched_points.append(point)
         else:
-            missing.append(point)
-
-    score = int((len(matched)/len(ques['key_points'])) * 10)
-
-    if len(ans.split()) >30:
-        score = min(10,score+2)
-
-    if score >= 7:
-        feedback = f"Great job! You covered {len(matched)}/{len(ques['key_points'])} key points."
-    elif score >= 4:
-        feedback = f"Good! You covered {len(matched)}/{len(ques['key_points'])} points. Please review missing points."
+            missing_points.append(point)
+    
+    if len(key_points) > 0:
+        coverage_ratio = len(matched_points) / len(key_points)
     else:
-        feedback = "Uh oh! Please review the model answer and study the key concepts."
-
+        coverage_ratio = 0.5
+    
+    base_score = coverage_ratio * max_marks
+    
+    word_limit = question.get('word_limit', '50-100 words')
+    score = adjust_for_word_limit(base_score, word_count, word_limit, max_marks)
+    
+    score = round(score * 2) / 2
+    
+    percentage = (score / max_marks * 100) if max_marks > 0 else 0
+    feedback = generate_feedback(score, max_marks, matched_points, missing_points, word_count)
+    
     return {
         'score': score,
-        'matched_points': matched or ["Partial credit for attempt"],
-        'missing_points': missing,
-        'feedback': feedback
+        'max_score': max_marks,
+        'percentage': percentage,
+        'feedback': feedback,
+        'matched_points': matched_points,
+        'missing_points': missing_points,
+        'word_count': word_count
     }
-    
 
+def extract_keywords(text):
+    common_words = {'the', 'is', 'are', 'was', 'were', 'a', 'an', 'and', 'or', 'but', 
+                   'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
+    words = text.lower().split()
+    keywords = [w for w in words if w not in common_words and len(w) > 3]
+    return keywords[:5]
+
+def adjust_for_word_limit(score, word_count, word_limit, max_marks):
+    if 'VSA' in str(word_limit) or '20-30' in str(word_limit):
+        min_words, max_words = 15, 40
+    elif 'SA' in str(word_limit) or '50' in str(word_limit):
+        min_words, max_words = 40, 100
+    elif 'LA' in str(word_limit) or '100' in str(word_limit):
+        min_words, max_words = 80, 180
+    else:
+        return score
+    
+    if word_count < min_words:
+        penalty = (min_words - word_count) / min_words * 0.3
+        score = score * (1 - penalty)
+    elif word_count > max_words * 1.5:
+        score = score * 0.95
+    
+    return max(0, min(score, max_marks))
+
+def generate_feedback(score, max_marks, matched, missing, word_count):
+    percentage = (score / max_marks * 100) if max_marks > 0 else 0
+    feedback_parts = []
+    
+    if percentage >= 90:
+        feedback_parts.append("🌟 Excellent! Outstanding answer.")
+    elif percentage >= 75:
+        feedback_parts.append("✅ Very Good! Well-explained answer.")
+    elif percentage >= 60:
+        feedback_parts.append("👍 Good attempt. Answer is satisfactory.")
+    elif percentage >= 40:
+        feedback_parts.append("⚠️ Fair attempt. Needs more detail.")
+    else:
+        feedback_parts.append("❌ Weak answer. Requires significant improvement.")
+    
+    if matched:
+        feedback_parts.append(f"Covered {len(matched)} key point(s).")
+    
+    if missing:
+        if len(missing) <= 2:
+            feedback_parts.append(f"Missing: {', '.join(missing[:2])}")
+        else:
+            feedback_parts.append(f"Missing {len(missing)} important points.")
+    
+    feedback_parts.append(f"Word count: {word_count}")
+    return " ".join(feedback_parts)
+
+def calculate_total_score(results):
+    total = sum(r['evaluation']['score'] for r in results)
+    max_total = sum(r['evaluation']['max_score'] for r in results)
+    percentage = (total / max_total * 100) if max_total > 0 else 0
+    
+    return {
+        'total_score': total,
+        'max_score': max_total,
+        'percentage': percentage
+    }

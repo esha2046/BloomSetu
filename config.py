@@ -17,8 +17,10 @@ if API_KEY:
     except Exception:
         pass
 
-
 MIN_CONTENT_LENGTH = 50
-MAX_CONTENT_LENGTH = 3000 #max char for chunking
+MAX_CONTENT_LENGTH = 3000
 MAX_PDF_PAGES = 5 
-REQUEST_COOLDOWN = 10 #seconds duh
+REQUEST_COOLDOWN = 10
+
+DAILY_LIMIT = 10  
+MAX_CACHE_AGE_HOURS = 24
