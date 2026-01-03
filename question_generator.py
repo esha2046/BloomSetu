@@ -4,6 +4,7 @@ import hashlib
 import time
 import json
 from curriculum import get_keywords_for_bloom, get_question_type_info
+from ncert_references import get_ncert_reference
 import pickle
 from pathlib import Path
 from config import MAX_CACHE_AGE_HOURS
@@ -68,13 +69,15 @@ def generate_with_api(content, info):
             questions = parse_json(text)
             
             if questions:
+                ncert_ref = get_ncert_reference(info['subject'], info['class'], info['chapter'])
                 for q in questions:
                     q.update({
                         'board': info['board'],
                         'class': info['class'],
                         'subject': info['subject'],
                         'chapter': info['chapter'],
-                        'bloom_level': info['bloom_level']
+                        'bloom_level': info['bloom_level'],
+                        'ncert_reference': ncert_ref
                     })
                 
                 result = questions[:info['num_questions']]
@@ -186,6 +189,7 @@ def parse_json(text):
 def generate_demo(info):
     time.sleep(1)
     q_type_info = get_question_type_info(info['question_type'])
+    ncert_ref = get_ncert_reference(info['subject'], info['class'], info['chapter'])
     questions = []
     
     for i in range(info['num_questions']):
@@ -210,7 +214,10 @@ def generate_demo(info):
         q.update({
             'board': info['board'], 'class': info['class'],
             'subject': info['subject'], 'chapter': info['chapter'],
-            'bloom_level': info['bloom_level']
+            'bloom_level': info['bloom_level'],
+            'chapter': info['chapter'],
+            'bloom_level': info['bloom_level'],
+            'ncert_reference': ncert_ref
         })
         questions.append(q)
     

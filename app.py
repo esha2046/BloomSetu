@@ -10,6 +10,7 @@ from curriculum import BOARDS, CLASSES, ALL_SUBJECTS, QUESTION_TYPES, get_chapte
 from shared_state import save_questions, load_questions, save_student_result, load_student_history
 from auth import login_page, register_page, logout, check_auth, init_users
 
+
 # Initialize
 init_users()
 
@@ -255,6 +256,9 @@ if st.session_state.role == "teacher":
                 ):
                     st.markdown(question['question'])
 
+                    if question.get('ncert_reference'):
+                        st.caption(question['ncert_reference'])
+
                     if 'options' in question:
                         for key, value in question['options'].items():
                             st.markdown(f"{key}) {value}")
@@ -352,6 +356,9 @@ else:
             marks = question.get('marks', 1)
             st.markdown(f"### Question {idx} [{marks} marks]")
             st.markdown(f"**{question['question']}**")
+
+            if question.get('ncert_reference'):
+                st.info(question['ncert_reference'])
 
             if 'options' in question:
                 current = st.session_state.student_answers.get(idx)
