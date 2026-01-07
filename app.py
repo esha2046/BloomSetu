@@ -1,8 +1,9 @@
 import streamlit as st
 import time
 from datetime import datetime
+import io
 
-from config import API_avai, REQUEST_COOLDOWN, MIN_CONTENT_LENGTH, DAILY_LIMIT
+from config import API_avai, REQUEST_COOLDOWN, MIN_CONTENT_LENGTH, DAILY_LIMIT, OPTIMAL_CONTENT_LENGTH, MAX_IMAGE_SIZE_KB
 from extract import extract_pdf, extract_docx
 from question_generator import generate_questions
 from evaluate import evaluate_answer, calculate_total_score
@@ -36,6 +37,7 @@ def init_session_state():
         'results': None,
         'last_request_time': 0,
         'extracted_content': "",
+        'extracted_images': [],
         'board': 'CBSE',
         'class_level': 10,
         'subject': 'Physics',
@@ -170,12 +172,21 @@ if st.session_state.role == "teacher":
                 uploaded_file = st.file_uploader("Upload PDF or DOCX", type=['pdf', 'docx'])
                 if uploaded_file:
                     with st.spinner("Extracting text..."):
-                        content = extract_pdf(uploaded_file) if uploaded_file.name.endswith('.pdf') else extract_docx(uploaded_file)
+                        if uploaded_file.name.endswith('.pdf'):
+                            content, images = extract_pdf(uploaded_file)
+                            st.session_state.extracted_images = images
+                        else:
+                            content = extract_docx(uploaded_file)
+                            st.session_state.extracted_images = []
+                        if not content:
+                            content = ""
                     if content:
                         st.session_state.extracted_content = content
                         with st.expander("Preview"):
                             st.text(content[:1500] + ("..." if len(content) > 1500 else ""))
-                        st.success(f"Extracted {len(content)} characters")
+                            if st.session_state.get('extracted_images'):
+                                st.image(st.session_state.extracted_images, caption=[f"Image {i+1}" for i in range(len(st.session_state.extracted_images))])
+                        st.success(f"Extracted {len(content)} characters" + (f" and {len(st.session_state.extracted_images)} images" if st.session_state.get('extracted_images') else ""))
 
         with col2:
             st.subheader("Question Settings")
@@ -215,6 +226,37 @@ if st.session_state.role == "teacher":
                 elif API_avai and not check_quota():
                     st.error(f"Daily limit reached ({DAILY_LIMIT} assessments). Using demo mode.")
                 else:
+                    # Show optimization warnings
+                    images = st.session_state.get('extracted_images', [])
+                    warnings = []
+                    
+                    if len(content) > OPTIMAL_CONTENT_LENGTH:
+                        reduction = len(content) - OPTIMAL_CONTENT_LENGTH
+                        warnings.append(f"📝 Content will be optimized ({reduction} chars will be trimmed)")
+                    
+                    if images and q_type in ['IMAGE', 'DIAGRAM']:
+                        # Estimate image sizes
+                        try:
+                            img_sizes = []
+                            for img in images[:1]:
+                                img_bytes = io.BytesIO()
+                                img.save(img_bytes, format='JPEG')
+                                img_sizes.append(len(img_bytes.getvalue()) / 1024)
+                            if img_sizes:
+                                max_img_size = max(img_sizes)
+                                if max_img_size > MAX_IMAGE_SIZE_KB:
+                                    warnings.append(f"🖼️ Images will be compressed (target: <{MAX_IMAGE_SIZE_KB}KB each)")
+                                warnings.append(f"🖼️ {len(images[:1])} image(s) will be sent to API")
+                        except:
+                            warnings.append(f"🖼️ {len(images[:1])} image(s) will be sent to API")
+                    elif images and q_type not in ['IMAGE', 'DIAGRAM']:
+                        warnings.append(f"ℹ️ {len(images)} image(s) extracted but won't be sent (not needed for {q_type})")
+                    
+                    if warnings and API_avai:
+                        with st.expander("⚡ Optimization Info", expanded=False):
+                            for warning in warnings:
+                                st.info(warning)
+                    
                     curriculum_info = {
                         'board': st.session_state.board,
                         'class': st.session_state.class_level,
@@ -227,12 +269,16 @@ if st.session_state.role == "teacher":
 
                     with st.spinner("Generating questions..."):
                         was_using_api = API_avai and check_quota()
-                        questions = generate_questions(content, curriculum_info)
+                        images = st.session_state.get('extracted_images', [])
+                        questions = generate_questions(content, curriculum_info, images)
                         if questions and was_using_api:
                             increment_quota()
 
                     if questions:
                         st.session_state.questions = questions
+                        # Ensure images are preserved in session state
+                        if images:
+                            st.session_state.extracted_images = images
                         st.success(f"✅ Generated {len(questions)} questions")
 
         if st.session_state.questions:
@@ -255,6 +301,23 @@ if st.session_state.role == "teacher":
                     expanded=(idx == 1)
                 ):
                     st.markdown(question['question'])
+                    
+                    # Display image if available
+                    images = st.session_state.get('extracted_images', [])
+                    if images:
+                        # Check if this question should have an image
+                        img_idx = question.get('image_index', 0)
+                        should_show_image = False
+                        
+                        # Check various conditions for showing image
+                        if question.get('has_image') or question.get('image_index') is not None:
+                            should_show_image = True
+                        # Check if question mentions diagram/figure/image
+                        elif any(keyword in question.get('question', '').lower() for keyword in ['diagram', 'figure', 'image', 'observe', 'shown']):
+                            should_show_image = True
+                        
+                        if should_show_image and img_idx < len(images):
+                            st.image(images[img_idx], caption=f"Diagram/Image for Question {idx}", use_container_width=True)
 
                     if question.get('ncert_reference'):
                         st.caption(question['ncert_reference'])
@@ -264,6 +327,15 @@ if st.session_state.role == "teacher":
                             st.markdown(f"{key}) {value}")
                         st.success(f"✓ Correct Answer: {question['correct_answer']}")
                         st.info(f"💡 {question['explanation']}")
+                    elif 'labels' in question:
+                        st.markdown("**Correct Labels**")
+                        for label_key, label_name in question['labels'].items():
+                            st.markdown(f"**{label_key}**: {label_name}")
+                        st.markdown("**Model Answer**")
+                        st.write(question['model_answer'])
+                        st.markdown("**Key Points**")
+                        for point in question['key_points']:
+                            st.markdown(f"- {point}")
                     else:
                         st.markdown("**Model Answer**")
                         st.write(question['model_answer'])
@@ -327,6 +399,8 @@ else:
         st.session_state.questions = questions
         st.session_state.student_answers = {}
         st.session_state.results = None
+        # Try to preserve images if they exist in session state
+        # (Images should be in session state from when teacher generated questions)
 
     if not st.session_state.questions:
         st.warning("⏳ No assessment available")
@@ -356,6 +430,23 @@ else:
             marks = question.get('marks', 1)
             st.markdown(f"### Question {idx} [{marks} marks]")
             st.markdown(f"**{question['question']}**")
+            
+            # Display image if available
+            images = st.session_state.get('extracted_images', [])
+            if images:
+                # Check if this question should have an image
+                img_idx = question.get('image_index', 0)
+                should_show_image = False
+                
+                # Check various conditions for showing image
+                if question.get('has_image') or question.get('image_index') is not None:
+                    should_show_image = True
+                # Check if question mentions diagram/figure/image
+                elif any(keyword in question.get('question', '').lower() for keyword in ['diagram', 'figure', 'image', 'observe', 'shown']):
+                    should_show_image = True
+                
+                if should_show_image and img_idx < len(images):
+                    st.image(images[img_idx], caption=f"Diagram/Image for Question {idx}", use_container_width=True)
 
             if question.get('ncert_reference'):
                 st.info(question['ncert_reference'])
@@ -371,6 +462,20 @@ else:
                     index=option_keys.index(current) if current in option_keys else 0
                 )
                 st.session_state.student_answers[idx] = answer
+            elif 'labels' in question:
+                # Diagram labeling question
+                st.caption("💡 Label each part of the diagram")
+                current = st.session_state.student_answers.get(idx, {})
+                labels_dict = {}
+                for label_key, label_name in question['labels'].items():
+                    label_answer = st.text_input(
+                        f"Label {label_key} ({label_name}):",
+                        value=current.get(label_key, ""),
+                        key=f"q_{idx}_label_{label_key}",
+                        placeholder=f"Enter label for {label_name}"
+                    )
+                    labels_dict[label_key] = label_answer
+                st.session_state.student_answers[idx] = labels_dict
             else:
                 word_limit = question.get('word_limit', 'As required')
                 st.caption(f"📏 Word Limit: {word_limit}")
@@ -498,6 +603,18 @@ else:
                                 st.markdown("❌ **Points Missed**")
                                 for point in eval_data['missing_points']:
                                     st.markdown(f"- {point}")
+                    elif 'matched_labels' in eval_data:
+                        col_a, col_b = st.columns(2)
+                        with col_a:
+                            if eval_data.get('matched_labels'):
+                                st.markdown("✅ **Correct Labels**")
+                                for label in eval_data['matched_labels']:
+                                    st.markdown(f"- {label}")
+                        with col_b:
+                            if eval_data.get('missing_labels'):
+                                st.markdown("❌ **Incorrect/Missing Labels**")
+                                for label in eval_data['missing_labels']:
+                                    st.markdown(f"- {label}")
 
                     st.info(f"💡 **Feedback:** {eval_data['feedback']}")
 

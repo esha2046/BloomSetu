@@ -1,6 +1,8 @@
 def evaluate_answer(question, student_answer):
     if 'options' in question:
         return evaluate_mcq(question, student_answer)
+    elif 'labels' in question:
+        return evaluate_diagram_labeling(question, student_answer)
     else:
         return evaluate_descriptive(question, student_answer)
 
@@ -17,6 +19,54 @@ def evaluate_mcq(question, student_answer):
         'percentage': 100 if is_correct else 0,
         'feedback': (question['explanation'] if is_correct 
                     else f"Correct answer: {correct_answer}. {question['explanation']}")
+    }
+
+def evaluate_diagram_labeling(question, student_answer):
+    """Evaluate diagram labeling questions"""
+    if not student_answer or not isinstance(student_answer, dict):
+        return {
+            'score': 0,
+            'max_score': question.get('marks', 3),
+            'percentage': 0,
+            'feedback': "No labels provided",
+            'matched_labels': [],
+            'missing_labels': list(question.get('labels', {}).keys())
+        }
+    
+    correct_labels = question.get('labels', {})
+    matched = []
+    missing = []
+    score = 0
+    
+    for label_key, correct_name in correct_labels.items():
+        student_label = student_answer.get(label_key, "").strip().lower()
+        correct_lower = correct_name.lower()
+        
+        # Simple matching: check if student answer contains key words
+        key_words = [w for w in correct_lower.split() if len(w) > 3]
+        matches = sum(1 for word in key_words if word in student_label)
+        
+        if matches >= len(key_words) * 0.5 or student_label in correct_lower:
+            matched.append(f"{label_key}: {correct_name}")
+            score += question.get('marks', 3) / len(correct_labels)
+        else:
+            missing.append(f"{label_key}: {correct_name} (You: {student_answer.get(label_key, 'N/A')})")
+    
+    score = round(score * 2) / 2  # Round to 0.5
+    max_marks = question.get('marks', 3)
+    percentage = (score / max_marks * 100) if max_marks > 0 else 0
+    
+    feedback = f"Matched {len(matched)}/{len(correct_labels)} labels. "
+    if missing:
+        feedback += f"Review: {', '.join(missing[:2])}"
+    
+    return {
+        'score': min(score, max_marks),
+        'max_score': max_marks,
+        'percentage': percentage,
+        'feedback': feedback,
+        'matched_labels': matched,
+        'missing_labels': missing
     }
 
 def evaluate_descriptive(question, student_answer):

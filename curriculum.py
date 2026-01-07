@@ -38,6 +38,22 @@ QUESTION_TYPES = {
         "marks": 5,
         "word_limit": "100-150 words",
         "description": "5 marks question"
+    },
+    "IMAGE": {
+        "name": "Image-based Question",
+        "marks": 3,
+        "description": "Question about an image/diagram"
+    },
+    "DIAGRAM": {
+        "name": "Diagram Labeling",
+        "marks": 3,
+        "description": "Label parts of a diagram"
+    },
+    "CASE_STUDY": {
+        "name": "Case Study",
+        "marks": 5,
+        "word_limit": "150-200 words",
+        "description": "Scenario-based question"
     }
 }
 
