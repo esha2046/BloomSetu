@@ -3,6 +3,7 @@ import streamlit as st
 import hashlib
 import time
 import json
+import re
 from curriculum import get_keywords_for_bloom, get_question_type_info
 from ncert_references import get_ncert_reference
 import pickle
@@ -129,9 +130,30 @@ def generate_with_api(content, info, images=None):
             )
             
             text = extract_text(response)
+            
+            # Debug: Show raw response if parsing fails
+            if not text or len(text.strip()) < 10:
+                st.warning("API returned empty or very short response. Retrying...")
+                if attempt == 0:
+                    time.sleep(2)
+                    continue
+                else:
+                    break
+            
             questions = parse_json(text)
             
-            if questions:
+            # Validate parsed questions
+            if questions and isinstance(questions, list) and len(questions) > 0:
+                # Check if questions are not placeholders
+                first_q = questions[0] if questions else {}
+                question_text = first_q.get('question', '')
+                if 'sample' in question_text.lower() or 'placeholder' in question_text.lower() or len(question_text) < 20:
+                    st.warning("Generated questions appear to be placeholders. Retrying with improved prompt...")
+                    if attempt == 0:
+                        time.sleep(2)
+                        continue
+                
+            if questions and isinstance(questions, list) and len(questions) > 0:
                 ncert_ref = get_ncert_reference(info['subject'], info['class'], info['chapter'])
                 for idx, q in enumerate(questions):
                     q.update({
@@ -158,11 +180,24 @@ def generate_with_api(content, info, images=None):
                 return result
         
         except Exception as e:
-            st.error(f"Generation error: {e}")
-            if attempt == 0:
+            error_msg = str(e)
+            st.error(f"Generation error: {error_msg}")
+            # Show more details in debug mode
+            if "quota" in error_msg.lower() or "limit" in error_msg.lower():
+                st.warning("API quota may be exceeded. Using demo mode.")
+            elif attempt == 0:
+                st.info("Retrying API call...")
                 time.sleep(2)
+            else:
+                st.warning("API call failed. Falling back to demo mode.")
     
-    return generate_demo(info, images)
+    # Only use demo if API is unavailable or all attempts failed
+    if not API_avai:
+        return generate_demo(info, images)
+    else:
+        # Try one more time with a simpler approach or return demo
+        st.warning("⚠️ Could not generate questions from API. Using demo questions.")
+        return generate_demo(info, images)
 
 def build_prompt(content, info, images=None):
     q_type_info = get_question_type_info(info['question_type'])
@@ -171,36 +206,50 @@ def build_prompt(content, info, images=None):
     base = f"""You are creating questions for {info['board']} Board, Class {info['class']}, {info['subject']} exam.
 Chapter: {info['chapter'] if info['chapter'] else 'General'}
 
-STRICT REQUIREMENTS:
+CRITICAL REQUIREMENTS:
+- Generate REAL, SPECIFIC questions based on the content provided below
+- DO NOT use placeholder text like "Sample question" or "Question text here"
+- Questions must be directly related to the content provided
 - Follow NCERT/CBSE pattern exactly
 - Use Indian exam terminology: {', '.join(keywords[:4])}
-- Return ONLY valid JSON, no explanations
-- Questions must be based ONLY on the content provided
+- Return ONLY valid JSON array, no explanations or markdown
 - Use proper Indian English (colour, favour, etc.)
+- Each question must be unique and specific to the content
 
-CONTENT TO USE:
+CONTENT TO USE FOR GENERATING QUESTIONS:
 {content}
 
 Question Details:
 - Type: {q_type_info['name']}
 - Marks per question: {q_type_info['marks']}
-- Bloom's Level: {info['bloom_level']}
+- Bloom's Taxonomy Level: {info['bloom_level']}
+- Number of questions needed: {info['num_questions']}
+
+IMPORTANT: Generate actual questions based on the content above. Do not use placeholder text.
 """
 
     if info['question_type'] == 'MCQ':
         return base + f"""
-Create exactly {info['num_questions']} multiple choice questions.
+Generate exactly {info['num_questions']} multiple choice questions based on the content provided above.
 
-JSON FORMAT:
+Each question must:
+1. Be a specific question directly related to the content
+2. Test understanding at {info['bloom_level']} level
+3. Have 4 distinct options where only one is correct
+4. Include a clear explanation
+
+JSON FORMAT (return ONLY the JSON array, no other text):
 [
   {{
-    "question": "Question text here?",
-    "options": {{"A": "First option", "B": "Second option", "C": "Third option", "D": "Fourth option"}},
+    "question": "Write a specific question based on the content above?",
+    "options": {{"A": "Option based on content", "B": "Another option", "C": "Third option", "D": "Fourth option"}},
     "correct_answer": "A",
-    "explanation": "Why this answer is correct",
+    "explanation": "Explanation why this answer is correct based on the content",
     "marks": {q_type_info['marks']}
   }}
 ]
+
+Remember: Generate REAL questions based on the content. Do not use placeholder text.
 """
     elif info['question_type'] == 'IMAGE':
         return base + f"""
@@ -253,19 +302,27 @@ JSON FORMAT:
         return base + f"""
 - Word Limit: {q_type_info.get('word_limit', 'As required')}
 
-Create exactly {info['num_questions']} descriptive questions.
+Generate exactly {info['num_questions']} descriptive questions based on the content provided above.
 
-JSON FORMAT:
+Each question must:
+1. Be a complete, specific question related to the content
+2. Test understanding at {info['bloom_level']} level
+3. Have a detailed model answer based on the content
+4. Include specific key points from the content
+
+JSON FORMAT (return ONLY the JSON array, no other text):
 [
   {{
-    "question": "Question text here?",
+    "question": "Write a specific question based on the content provided above?",
     "marks": {q_type_info['marks']},
     "word_limit": "{q_type_info.get('word_limit', 'As required')}",
-    "model_answer": "Complete answer following NCERT pattern",
-    "key_points": ["First key concept", "Second key concept", "Third key concept"],
-    "marking_scheme": ["Award 1 mark for concept", "Award 1 mark for explanation", "Award 1 mark for example"]
+    "model_answer": "Detailed answer based on the content, following NCERT pattern",
+    "key_points": ["Specific concept from content", "Another specific point from content", "Third specific point"],
+    "marking_scheme": ["Award marks for first concept", "Award marks for second concept", "Award marks for third concept"]
   }}
 ]
+
+Remember: Generate REAL questions based on the content. Do not use placeholder text.
 """
 
 def extract_text(response):
@@ -278,8 +335,13 @@ def extract_text(response):
     return ""
 
 def parse_json(text):
-
+    """Parse JSON from API response, handling various formats"""
+    if not text or len(text.strip()) < 5:
+        return []
+    
     text = text.strip()
+    
+    # Remove markdown code blocks
     if text.startswith("```json"):
         text = text[7:]
     elif text.startswith("```"):
@@ -288,18 +350,45 @@ def parse_json(text):
         text = text[:-3]
     text = text.strip()
     
+    # Try direct JSON parsing first
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, list) and len(parsed) > 0:
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    
+    # Try to extract JSON array from text
+    start_idx = text.find('[')
+    end_idx = text.rfind(']')
+    
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        try:
+            json_str = text[start_idx:end_idx+1]
+            parsed = json.loads(json_str)
+            if isinstance(parsed, list) and len(parsed) > 0:
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    
+    # Last attempt: try to find and parse individual question objects
+    try:
+        # Look for question objects
+        question_pattern = r'\{\s*"question"\s*:\s*"[^"]+"'
+        if re.search(question_pattern, text):
+            # Try to fix common JSON issues
+            text = re.sub(r',\s*}', '}', text)  # Remove trailing commas
+            text = re.sub(r',\s*]', ']', text)  # Remove trailing commas before ]
+            start_idx = text.find('[')
+            end_idx = text.rfind(']')
+            if start_idx != -1 and end_idx != -1:
+                json_str = text[start_idx:end_idx+1]
+                parsed = json.loads(json_str)
+                if isinstance(parsed, list) and len(parsed) > 0:
+                    return parsed
     except:
         pass
     
-    s = text.find('[')
-    e = text.rfind(']')
-    if s!=-1 and e!=-1:
-        try:
-            return json.loads(text[s:e+1])
-        except:
-            pass
     return []
 
 def generate_demo(info, images=None):

@@ -35,3 +35,7 @@ MAX_IMAGES_PER_REQUEST = 1  # Only send 1 image per API call
 # Content optimization
 ENABLE_CONTENT_OPTIMIZATION = True
 ENABLE_IMAGE_OPTIMIZATION = True
+
+# ML Evaluation settings
+ENABLE_SEMANTIC_EVALUATION = True
+SEMANTIC_SIMILARITY_THRESHOLD = 0.6  # Minimum similarity for partial credit
