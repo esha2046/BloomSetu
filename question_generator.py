@@ -11,67 +11,167 @@ from pathlib import Path
 from config import MAX_CACHE_AGE_HOURS
 from PIL import Image
 import io
+from functools import lru_cache
+from typing import Optional, List, Dict, Any
 
 
 CACHE_FILE = Path("question_cache.pkl")
+IMAGE_HASH_CACHE = {}  # In-memory cache for image hashes
+_cache_data = None  # Lazy-loaded cache data
+_cache_loaded = False  # Track if cache has been loaded
 
-def optimize_content(content, chapter=None, max_length=OPTIMAL_CONTENT_LENGTH):
-    """Optimize content length for API efficiency"""
+def optimize_content(content: str, chapter: Optional[str] = None, max_length: int = OPTIMAL_CONTENT_LENGTH) -> str:
+    """Optimize content length for API efficiency with improved text extraction"""
     if not ENABLE_CONTENT_OPTIMIZATION or len(content) <= max_length:
         return content
     
-    # If chapter specified, try to extract relevant paragraphs
+    # If chapter specified, try to extract relevant paragraphs first
     if chapter:
-        paragraphs = content.split('\n\n')
-        relevant = [p for p in paragraphs if chapter.lower() in p.lower()]
-        if relevant:
-            content = '\n\n'.join(relevant)
-            if len(content) <= max_length:
-                return content
+        chapter_lower = chapter.lower()
+        paragraphs = [p.strip() for p in content.split('\n\n') if p.strip()]
+        
+        # Score paragraphs by relevance (exact match > partial match)
+        scored_paragraphs = []
+        for p in paragraphs:
+            p_lower = p.lower()
+            if chapter_lower in p_lower:
+                score = 2 if chapter_lower == p_lower[:len(chapter_lower)] else 1
+                scored_paragraphs.append((score, p))
+        
+        if scored_paragraphs:
+            # Sort by relevance and take top paragraphs
+            scored_paragraphs.sort(key=lambda x: x[0], reverse=True)
+            relevant = [p for _, p in scored_paragraphs]
+            optimized = '\n\n'.join(relevant)
+            
+            # If optimized content fits, return it
+            if len(optimized) <= max_length:
+                return optimized
+            
+            # Otherwise, use optimized content for further truncation
+            content = optimized
     
-    # Truncate to optimal length, keeping complete sentences
+    # Smart truncation: preserve complete sentences and paragraphs
     if len(content) > max_length:
-        truncated = content[:max_length]
-        last_period = truncated.rfind('.')
-        last_newline = truncated.rfind('\n')
-        cut_point = max(last_period, last_newline)
-        if cut_point > max_length * 0.7:  # Only cut if we keep at least 70%
-            content = truncated[:cut_point + 1]
+        # Try to find a good break point at sentence boundaries
+        target_length = int(max_length * 0.95)  # Use 95% to leave buffer
+        truncated = content[:target_length]
+        
+        # Find the last complete sentence
+        sentence_endings = ['.', '!', '?', '।']  # Include Hindi full stop
+        best_cut = -1
+        
+        for ending in sentence_endings:
+            last_pos = truncated.rfind(ending)
+            if last_pos > target_length * 0.7:  # Only if we keep at least 70%
+                best_cut = max(best_cut, last_pos)
+        
+        # Also check for paragraph breaks
+        last_para = truncated.rfind('\n\n')
+        if last_para > target_length * 0.7:
+            best_cut = max(best_cut, last_para)
+        
+        if best_cut > target_length * 0.7:
+            content = content[:best_cut + 1].strip()
         else:
-            content = truncated
+            # Fallback: truncate at word boundary
+            last_space = truncated.rfind(' ')
+            if last_space > target_length * 0.8:
+                content = content[:last_space].strip()
+            else:
+                content = truncated.strip()
     
     return content
 
-def get_image_hash(images):
-    """Generate hash for images for caching"""
+def get_image_hash(images: Optional[List[Image.Image]]) -> str:
+    """Generate hash for images with caching to avoid reprocessing"""
     if not images:
         return ""
+    
     try:
+        # Use image id as cache key (PIL images have unique ids)
+        image_ids = tuple(id(img) for img in images[:MAX_IMAGES_PER_REQUEST])
+        
+        # Check cache first
+        if image_ids in IMAGE_HASH_CACHE:
+            return IMAGE_HASH_CACHE[image_ids]
+        
+        # Generate hashes
         hashes = []
         for img in images[:MAX_IMAGES_PER_REQUEST]:
             img_bytes = io.BytesIO()
-            img.save(img_bytes, format='JPEG')
+            img.save(img_bytes, format='JPEG', quality=85, optimize=True)
             img_hash = hashlib.md5(img_bytes.getvalue()).hexdigest()
             hashes.append(img_hash)
-        return "_".join(hashes)
-    except:
+        
+        result = "_".join(hashes)
+        
+        # Cache the result (limit cache size to prevent memory issues)
+        if len(IMAGE_HASH_CACHE) < 100:  # Limit to 100 entries
+            IMAGE_HASH_CACHE[image_ids] = result
+        
+        return result
+    except Exception:
         return ""
 
-def load_cache():
+def load_cache() -> Dict[str, tuple]:
+    """Lazy load cache - only load when needed"""
+    global _cache_data, _cache_loaded
+    
+    if _cache_loaded:
+        return _cache_data if _cache_data is not None else {}
+    
     if CACHE_FILE.exists():
         try:
             with open(CACHE_FILE, 'rb') as f:
-                return pickle.load(f)
-        except:
+                _cache_data = pickle.load(f)
+                _cache_loaded = True
+                return _cache_data if _cache_data is not None else {}
+        except Exception:
+            _cache_data = {}
+            _cache_loaded = True
             return {}
+    
+    _cache_data = {}
+    _cache_loaded = True
     return {}
 
-def save_cache(cache):
+def save_cache(cache: Dict[str, tuple], incremental: bool = True):
+    """Save cache with optional incremental updates"""
+    global _cache_data
+    
     try:
-        with open(CACHE_FILE, 'wb') as f:
+        # If incremental and we have existing cache, merge
+        if incremental and _cache_data:
+            cache = {**_cache_data, **cache}
+        
+        _cache_data = cache
+        
+        # Use atomic write to prevent corruption
+        temp_file = CACHE_FILE.with_suffix('.tmp')
+        with open(temp_file, 'wb') as f:
             pickle.dump(cache, f)
-    except:
+        temp_file.replace(CACHE_FILE)  # Atomic rename
+    except Exception:
         pass
+
+def cleanup_expired_cache():
+    """Remove expired entries from cache"""
+    global _cache_data
+    if not _cache_data:
+        return
+    
+    current_time = time.time()
+    expired_keys = [
+        key for key, (_, timestamp) in _cache_data.items()
+        if (current_time - timestamp) / 3600 >= MAX_CACHE_AGE_HOURS
+    ]
+    
+    for key in expired_keys:
+        del _cache_data[key]
+    
+    if expired_keys:
+        save_cache(_cache_data, incremental=False)
 
 def generate_questions(content, curriculum_info, images=None):
     if API_avai:
@@ -80,22 +180,26 @@ def generate_questions(content, curriculum_info, images=None):
         st.info("API unavailable. Using demo mode")
         return generate_demo(curriculum_info, images)
 
-def generate_with_api(content, info, images=None):
+def generate_with_api(content: str, info: Dict[str, Any], images: Optional[List[Image.Image]] = None) -> List[Dict[str, Any]]:
+    """Generate questions with API, optimized for performance"""
     # Optimize content before processing
     optimized_content = optimize_content(content, info.get('chapter'), OPTIMAL_CONTENT_LENGTH)
     if len(optimized_content) < len(content) and ENABLE_CONTENT_OPTIMIZATION:
         reduction = len(content) - len(optimized_content)
         st.info(f"✓ Content optimized: Reduced by {reduction} characters for API efficiency")
     
-    # Generate cache key including image hashes
+    # Generate cache key efficiently (use more content for better cache hits)
     image_hash = get_image_hash(images) if images else ""
-    cache_key = hashlib.md5(
-        f"{optimized_content[:200]}{info['board']}{info['class']}{info['subject']}"
+    # Use first 500 chars instead of 200 for better cache key uniqueness
+    content_sample = optimized_content[:500] if len(optimized_content) > 500 else optimized_content
+    cache_key_data = (
+        f"{content_sample}{info['board']}{info['class']}{info['subject']}"
         f"{info['chapter']}{info['num_questions']}{info['question_type']}"
-        f"{info['bloom_level']}{image_hash}".encode()
-    ).hexdigest()
+        f"{info['bloom_level']}{image_hash}"
+    )
+    cache_key = hashlib.md5(cache_key_data.encode()).hexdigest()
     
-    # Load persistent cache
+    # Load cache (lazy loading)
     cache = load_cache()
     
     # Check cache with expiry
@@ -105,21 +209,34 @@ def generate_with_api(content, info, images=None):
         if age_hours < MAX_CACHE_AGE_HOURS:
             st.info("✓ Using cached questions (saves API calls)")
             return cached_data
+        else:
+            # Remove expired entry
+            del cache[cache_key]
     
-    # Only send images if question type requires them
+    # Only send images if question type requires them (early exit optimization)
     images_to_send = None
-    if images and info['question_type'] in ['IMAGE', 'DIAGRAM']:
-        images_to_send = images[:MAX_IMAGES_PER_REQUEST]  # Only send 1 image
+    requires_images = info['question_type'] in ['IMAGE', 'DIAGRAM']
+    if images and requires_images:
+        images_to_send = images[:MAX_IMAGES_PER_REQUEST]
     
+    # Build prompt (cached internally)
     prompt = build_prompt(optimized_content, info, images_to_send)
     
-    for attempt in range(2):
+    # Pre-compute values used in loop
+    ncert_ref = get_ncert_reference(info['subject'], info['class'], info['chapter'])
+    num_questions_needed = info['num_questions']
+    question_type = info['question_type']
+    
+    # Exponential backoff retry logic
+    max_attempts = 2
+    base_delay = 1
+    
+    for attempt in range(max_attempts):
         try:
-            # Prepare content parts (text + images if needed)
+            # Prepare content parts efficiently
             content_parts = [prompt]
             if images_to_send:
-                for img in images_to_send:
-                    content_parts.append(img)
+                content_parts.extend(images_to_send)  # More efficient than loop
             
             response = model.generate_content(
                 content_parts,
@@ -131,65 +248,84 @@ def generate_with_api(content, info, images=None):
             
             text = extract_text(response)
             
-            # Debug: Show raw response if parsing fails
+            # Early validation
             if not text or len(text.strip()) < 10:
-                st.warning("API returned empty or very short response. Retrying...")
-                if attempt == 0:
-                    time.sleep(2)
+                if attempt < max_attempts - 1:
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff
+                    st.warning(f"API returned empty response. Retrying in {delay}s...")
+                    time.sleep(delay)
                     continue
-                else:
-                    break
+                break
             
             questions = parse_json(text)
             
-            # Validate parsed questions
-            if questions and isinstance(questions, list) and len(questions) > 0:
-                # Check if questions are not placeholders
-                first_q = questions[0] if questions else {}
-                question_text = first_q.get('question', '')
-                if 'sample' in question_text.lower() or 'placeholder' in question_text.lower() or len(question_text) < 20:
-                    st.warning("Generated questions appear to be placeholders. Retrying with improved prompt...")
-                    if attempt == 0:
-                        time.sleep(2)
-                        continue
-                
-            if questions and isinstance(questions, list) and len(questions) > 0:
-                ncert_ref = get_ncert_reference(info['subject'], info['class'], info['chapter'])
-                for idx, q in enumerate(questions):
-                    q.update({
-                        'board': info['board'],
-                        'class': info['class'],
-                        'subject': info['subject'],
-                        'chapter': info['chapter'],
-                        'bloom_level': info['bloom_level'],
-                        'ncert_reference': ncert_ref
-                    })
-                    # Attach image if available and question type requires it
-                    if images and (info['question_type'] in ['IMAGE', 'DIAGRAM']):
-                        # Use first image for all questions, or cycle through if multiple
-                        img_idx = idx % len(images) if len(images) > 0 else 0
-                        q['image_index'] = img_idx
-                        q['has_image'] = True
-                
-                result = questions[:info['num_questions']]
-                
-                # Save to persistent cache
-                cache[cache_key] = (result, time.time())
-                save_cache(cache)
-                
-                return result
+            # Validate parsed questions efficiently
+            if not questions or not isinstance(questions, list) or len(questions) == 0:
+                if attempt < max_attempts - 1:
+                    delay = base_delay * (2 ** attempt)
+                    st.warning(f"No valid questions parsed. Retrying in {delay}s...")
+                    time.sleep(delay)
+                    continue
+                break
+            
+            # Check for placeholder questions (single check)
+            first_q = questions[0]
+            question_text = first_q.get('question', '').lower()
+            is_placeholder = (
+                'sample' in question_text or 
+                'placeholder' in question_text or 
+                len(question_text) < 20
+            )
+            
+            if is_placeholder:
+                if attempt < max_attempts - 1:
+                    delay = base_delay * (2 ** attempt)
+                    st.warning(f"Generated questions appear to be placeholders. Retrying in {delay}s...")
+                    time.sleep(delay)
+                    continue
+                else:
+                    st.warning("⚠️ Generated questions may contain placeholders")
+            
+            # Enrich questions with metadata (batch operation)
+            metadata = {
+                'board': info['board'],
+                'class': info['class'],
+                'subject': info['subject'],
+                'chapter': info['chapter'],
+                'bloom_level': info['bloom_level'],
+                'ncert_reference': ncert_ref
+            }
+            
+            for idx, q in enumerate(questions):
+                q.update(metadata)
+                # Attach image if available and question type requires it
+                if images and requires_images:
+                    img_idx = idx % len(images) if len(images) > 0 else 0
+                    q['image_index'] = img_idx
+                    q['has_image'] = True
+            
+            result = questions[:num_questions_needed]
+            
+            # Save to cache incrementally
+            cache[cache_key] = (result, time.time())
+            save_cache({cache_key: cache[cache_key]}, incremental=True)
+            
+            return result
         
         except Exception as e:
-            error_msg = str(e)
-            st.error(f"Generation error: {error_msg}")
-            # Show more details in debug mode
-            if "quota" in error_msg.lower() or "limit" in error_msg.lower():
+            error_msg = str(e).lower()
+            st.error(f"Generation error: {str(e)}")
+            
+            # Handle specific error types
+            if "quota" in error_msg or "limit" in error_msg:
                 st.warning("API quota may be exceeded. Using demo mode.")
-            elif attempt == 0:
-                st.info("Retrying API call...")
-                time.sleep(2)
+                break
+            elif attempt < max_attempts - 1:
+                delay = base_delay * (2 ** attempt)
+                st.info(f"Retrying API call in {delay}s...")
+                time.sleep(delay)
             else:
-                st.warning("API call failed. Falling back to demo mode.")
+                st.warning("API call failed after retries. Falling back to demo mode.")
     
     # Only use demo if API is unavailable or all attempts failed
     if not API_avai:
@@ -199,19 +335,39 @@ def generate_with_api(content, info, images=None):
         st.warning("⚠️ Could not generate questions from API. Using demo questions.")
         return generate_demo(info, images)
 
-def build_prompt(content, info, images=None):
-    q_type_info = get_question_type_info(info['question_type'])
-    keywords = get_keywords_for_bloom(info['bloom_level'])
+# Cache prompt templates to avoid repeated string operations
+@lru_cache(maxsize=32)
+def _get_cached_keywords(bloom_level: str) -> tuple:
+    """Cache keywords for bloom level"""
+    return tuple(get_keywords_for_bloom(bloom_level)[:4])
+
+@lru_cache(maxsize=16)
+def _get_cached_q_type_info(question_type: str) -> tuple:
+    """Cache question type info"""
+    info = get_question_type_info(question_type)
+    return (info.get('name', ''), info.get('marks', 1), info.get('word_limit', 'As required'))
+
+def build_prompt(content: str, info: Dict[str, Any], images: Optional[List] = None) -> str:
+    """Build prompt efficiently with cached lookups"""
+    # Use cached lookups
+    q_type_info_tuple = _get_cached_q_type_info(info['question_type'])
+    q_type_name, q_type_marks, q_type_word_limit = q_type_info_tuple
     
+    keywords_tuple = _get_cached_keywords(info['bloom_level'])
+    keywords_str = ', '.join(keywords_tuple)
+    
+    chapter = info['chapter'] if info['chapter'] else 'General'
+    
+    # Build base prompt efficiently
     base = f"""You are creating questions for {info['board']} Board, Class {info['class']}, {info['subject']} exam.
-Chapter: {info['chapter'] if info['chapter'] else 'General'}
+Chapter: {chapter}
 
 CRITICAL REQUIREMENTS:
 - Generate REAL, SPECIFIC questions based on the content provided below
 - DO NOT use placeholder text like "Sample question" or "Question text here"
 - Questions must be directly related to the content provided
 - Follow NCERT/CBSE pattern exactly
-- Use Indian exam terminology: {', '.join(keywords[:4])}
+- Use Indian exam terminology: {keywords_str}
 - Return ONLY valid JSON array, no explanations or markdown
 - Use proper Indian English (colour, favour, etc.)
 - Each question must be unique and specific to the content
@@ -220,21 +376,26 @@ CONTENT TO USE FOR GENERATING QUESTIONS:
 {content}
 
 Question Details:
-- Type: {q_type_info['name']}
-- Marks per question: {q_type_info['marks']}
+- Type: {q_type_name}
+- Marks per question: {q_type_marks}
 - Bloom's Taxonomy Level: {info['bloom_level']}
 - Number of questions needed: {info['num_questions']}
 
 IMPORTANT: Generate actual questions based on the content above. Do not use placeholder text.
 """
 
-    if info['question_type'] == 'MCQ':
+    # Build type-specific prompt efficiently
+    question_type = info['question_type']
+    num_questions = info['num_questions']
+    bloom_level = info['bloom_level']
+    
+    if question_type == 'MCQ':
         return base + f"""
-Generate exactly {info['num_questions']} multiple choice questions based on the content provided above.
+Generate exactly {num_questions} multiple choice questions based on the content provided above.
 
 Each question must:
 1. Be a specific question directly related to the content
-2. Test understanding at {info['bloom_level']} level
+2. Test understanding at {bloom_level} level
 3. Have 4 distinct options where only one is correct
 4. Include a clear explanation
 
@@ -245,36 +406,36 @@ JSON FORMAT (return ONLY the JSON array, no other text):
     "options": {{"A": "Option based on content", "B": "Another option", "C": "Third option", "D": "Fourth option"}},
     "correct_answer": "A",
     "explanation": "Explanation why this answer is correct based on the content",
-    "marks": {q_type_info['marks']}
+    "marks": {q_type_marks}
   }}
 ]
 
 Remember: Generate REAL questions based on the content. Do not use placeholder text.
 """
-    elif info['question_type'] == 'IMAGE':
+    elif question_type == 'IMAGE':
         return base + f"""
-Create exactly {info['num_questions']} image-based questions. Questions should ask about diagrams, figures, or visual content.
+Create exactly {num_questions} image-based questions. Questions should ask about diagrams, figures, or visual content.
 
 JSON FORMAT:
 [
   {{
     "question": "Question about the image/diagram shown?",
-    "marks": {q_type_info['marks']},
+    "marks": {q_type_marks},
     "model_answer": "Answer describing what is shown in the image",
     "key_points": ["First observation", "Second observation", "Third observation"],
     "has_image": true
   }}
 ]
 """
-    elif info['question_type'] == 'DIAGRAM':
+    elif question_type == 'DIAGRAM':
         return base + f"""
-Create exactly {info['num_questions']} diagram labeling questions. Ask students to label parts of a diagram.
+Create exactly {num_questions} diagram labeling questions. Ask students to label parts of a diagram.
 
 JSON FORMAT:
 [
   {{
     "question": "Label the parts of the diagram shown:",
-    "marks": {q_type_info['marks']},
+    "marks": {q_type_marks},
     "labels": {{"1": "Part name 1", "2": "Part name 2", "3": "Part name 3"}},
     "model_answer": "Complete labeled diagram explanation",
     "key_points": ["Label 1 description", "Label 2 description", "Label 3 description"],
@@ -282,16 +443,16 @@ JSON FORMAT:
   }}
 ]
 """
-    elif info['question_type'] == 'CASE_STUDY':
+    elif question_type == 'CASE_STUDY':
         return base + f"""
-Create exactly {info['num_questions']} case study questions. Present a scenario and ask analytical questions.
+Create exactly {num_questions} case study questions. Present a scenario and ask analytical questions.
 
 JSON FORMAT:
 [
   {{
     "question": "Case study scenario: [Describe situation]. Based on this, answer: [Question]?",
-    "marks": {q_type_info['marks']},
-    "word_limit": "{q_type_info['word_limit']}",
+    "marks": {q_type_marks},
+    "word_limit": "{q_type_word_limit}",
     "model_answer": "Complete answer analyzing the case study",
     "key_points": ["First analysis point", "Second analysis point", "Third analysis point"],
     "marking_scheme": ["Award marks for identifying key factors", "Award marks for analysis", "Award marks for conclusion"]
@@ -300,13 +461,13 @@ JSON FORMAT:
 """
     else:
         return base + f"""
-- Word Limit: {q_type_info.get('word_limit', 'As required')}
+- Word Limit: {q_type_word_limit}
 
-Generate exactly {info['num_questions']} descriptive questions based on the content provided above.
+Generate exactly {num_questions} descriptive questions based on the content provided above.
 
 Each question must:
 1. Be a complete, specific question related to the content
-2. Test understanding at {info['bloom_level']} level
+2. Test understanding at {bloom_level} level
 3. Have a detailed model answer based on the content
 4. Include specific key points from the content
 
@@ -314,8 +475,8 @@ JSON FORMAT (return ONLY the JSON array, no other text):
 [
   {{
     "question": "Write a specific question based on the content provided above?",
-    "marks": {q_type_info['marks']},
-    "word_limit": "{q_type_info.get('word_limit', 'As required')}",
+    "marks": {q_type_marks},
+    "word_limit": "{q_type_word_limit}",
     "model_answer": "Detailed answer based on the content, following NCERT pattern",
     "key_points": ["Specific concept from content", "Another specific point from content", "Third specific point"],
     "marking_scheme": ["Award marks for first concept", "Award marks for second concept", "Award marks for third concept"]
@@ -334,23 +495,22 @@ def extract_text(response):
             return " ".join([p.text for p in parts if hasattr(p, 'text')])
     return ""
 
-def parse_json(text):
-    """Parse JSON from API response, handling various formats"""
+def parse_json(text: str) -> List[Dict[str, Any]]:
+    """Parse JSON from API response with optimized parsing"""
     if not text or len(text.strip()) < 5:
         return []
     
     text = text.strip()
     
-    # Remove markdown code blocks
+    # Remove markdown code blocks efficiently
     if text.startswith("```json"):
-        text = text[7:]
+        text = text[7:].strip()
     elif text.startswith("```"):
-        text = text[3:]
+        text = text[3:].strip()
     if text.endswith("```"):
-        text = text[:-3]
-    text = text.strip()
+        text = text[:-3].strip()
     
-    # Try direct JSON parsing first
+    # Try direct JSON parsing first (fastest path)
     try:
         parsed = json.loads(text)
         if isinstance(parsed, list) and len(parsed) > 0:
@@ -358,7 +518,7 @@ def parse_json(text):
     except json.JSONDecodeError:
         pass
     
-    # Try to extract JSON array from text
+    # Try to extract JSON array from text (common case)
     start_idx = text.find('[')
     end_idx = text.rfind(']')
     
@@ -371,14 +531,14 @@ def parse_json(text):
         except json.JSONDecodeError:
             pass
     
-    # Last attempt: try to find and parse individual question objects
+    # Last attempt: fix common JSON issues and retry
     try:
-        # Look for question objects
-        question_pattern = r'\{\s*"question"\s*:\s*"[^"]+"'
-        if re.search(question_pattern, text):
-            # Try to fix common JSON issues
+        # Quick check if it looks like JSON
+        if '[' in text and ']' in text and '"question"' in text:
+            # Fix common JSON issues (compiled regex for performance)
             text = re.sub(r',\s*}', '}', text)  # Remove trailing commas
             text = re.sub(r',\s*]', ']', text)  # Remove trailing commas before ]
+            
             start_idx = text.find('[')
             end_idx = text.rfind(']')
             if start_idx != -1 and end_idx != -1:
@@ -386,7 +546,7 @@ def parse_json(text):
                 parsed = json.loads(json_str)
                 if isinstance(parsed, list) and len(parsed) > 0:
                     return parsed
-    except:
+    except Exception:
         pass
     
     return []
