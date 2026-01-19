@@ -238,11 +238,14 @@ def generate_with_api(content: str, info: Dict[str, Any], images: Optional[List[
             if images_to_send:
                 content_parts.extend(images_to_send)  # More efficient than loop
             
+            # Adjust temperature for retries (lower = more consistent)
+            temperature = 0.2 if attempt > 0 else 0.3
+            
             response = model.generate_content(
                 content_parts,
                 generation_config={
-                    'temperature': 0.3,
-                    'max_output_tokens': 2048
+                    'temperature': temperature,
+                    'max_output_tokens': 4096  # Increased to handle longer case study questions
                 }
             )
             
@@ -259,16 +262,72 @@ def generate_with_api(content: str, info: Dict[str, Any], images: Optional[List[
             
             questions = parse_json(text)
             
-            # Validate parsed questions efficiently
+            # Validate parsed questions and their structure
             if not questions or not isinstance(questions, list) or len(questions) == 0:
+                # On retry, try a simpler prompt structure
                 if attempt < max_attempts - 1:
                     delay = base_delay * (2 ** attempt)
-                    st.warning(f"No valid questions parsed. Retrying in {delay}s...")
+                    st.warning(f"No valid questions parsed. Retrying with stricter prompt in {delay}s...")
                     time.sleep(delay)
+                    
+                    # Modify prompt for retry - be more explicit about JSON
+                    if attempt == 1:
+                        # Add more explicit JSON instructions
+                        prompt = build_prompt(optimized_content, info, images_to_send)
+                        prompt += "\n\nCRITICAL: Return ONLY valid JSON array. No markdown, no explanations, no code blocks. Start with [ and end with ]. Ensure all strings are properly closed with quotes."
+                        content_parts = [prompt]
+                        if images_to_send:
+                            content_parts.extend(images_to_send)
                     continue
+                else:
+                    # Last attempt failed - show helpful error
+                    if len(text) > 100:
+                        # Response seems long, might be truncated
+                        st.error(f"Failed to parse questions after {max_attempts} attempts. The response may be incomplete or malformed.")
+                    else:
+                        st.error(f"Failed to parse questions. Response was too short or invalid.")
                 break
             
-            # Check for placeholder questions (single check)
+            # Validate question structure and check for placeholders
+            valid_questions = []
+            for q in questions:
+                if not isinstance(q, dict):
+                    continue
+                
+                # Check for required fields based on question type
+                if question_type == 'MCQ':
+                    required_fields = ['question', 'options', 'correct_answer', 'explanation']
+                elif question_type in ['IMAGE', 'DIAGRAM']:
+                    required_fields = ['question', 'model_answer', 'key_points']
+                else:
+                    required_fields = ['question', 'model_answer', 'key_points']
+                
+                # Check if all required fields exist
+                if all(field in q for field in required_fields):
+                    # Check for placeholder text
+                    question_text = q.get('question', '').lower()
+                    if question_text and len(question_text) >= 20:
+                        if 'sample' not in question_text and 'placeholder' not in question_text:
+                            valid_questions.append(q)
+            
+            # If we lost questions due to validation, warn but continue if we have some
+            if len(valid_questions) < len(questions):
+                st.warning(f"⚠️ Filtered out {len(questions) - len(valid_questions)} invalid questions")
+            
+            # If no valid questions after filtering, retry
+            if len(valid_questions) == 0:
+                if attempt < max_attempts - 1:
+                    delay = base_delay * (2 ** attempt)
+                    st.warning(f"No valid questions after validation. Retrying in {delay}s...")
+                    time.sleep(delay)
+                    continue
+                else:
+                    st.error("⚠️ Could not generate valid questions after validation")
+                    break
+            
+            questions = valid_questions
+            
+            # Check first question for placeholder (additional check)
             first_q = questions[0]
             question_text = first_q.get('question', '').lower()
             is_placeholder = (
@@ -277,7 +336,8 @@ def generate_with_api(content: str, info: Dict[str, Any], images: Optional[List[
                 len(question_text) < 20
             )
             
-            if is_placeholder:
+            if is_placeholder and len(questions) == 1:
+                # Only retry if this is the only question and it's a placeholder
                 if attempt < max_attempts - 1:
                     delay = base_delay * (2 ** attempt)
                     st.warning(f"Generated questions appear to be placeholders. Retrying in {delay}s...")
@@ -399,7 +459,15 @@ Each question must:
 3. Have 4 distinct options where only one is correct
 4. Include a clear explanation
 
-JSON FORMAT (return ONLY the JSON array, no other text):
+CRITICAL JSON FORMAT REQUIREMENTS:
+- Return ONLY a valid JSON array
+- Start with [ and end with ]
+- No markdown code blocks (no ```json or ```)
+- No explanations before or after the JSON
+- Escape all quotes properly in strings
+- Use double quotes for all strings
+
+JSON FORMAT:
 [
   {{
     "question": "Write a specific question based on the content above?",
@@ -410,7 +478,7 @@ JSON FORMAT (return ONLY the JSON array, no other text):
   }}
 ]
 
-Remember: Generate REAL questions based on the content. Do not use placeholder text.
+Remember: Generate REAL questions based on the content. Return ONLY the JSON array, nothing else.
 """
     elif question_type == 'IMAGE':
         return base + f"""
@@ -471,7 +539,15 @@ Each question must:
 3. Have a detailed model answer based on the content
 4. Include specific key points from the content
 
-JSON FORMAT (return ONLY the JSON array, no other text):
+CRITICAL JSON FORMAT REQUIREMENTS:
+- Return ONLY a valid JSON array
+- Start with [ and end with ]
+- No markdown code blocks (no ```json or ```)
+- No explanations before or after the JSON
+- Escape all quotes properly in strings
+- Use double quotes for all strings
+
+JSON FORMAT:
 [
   {{
     "question": "Write a specific question based on the content provided above?",
@@ -483,7 +559,7 @@ JSON FORMAT (return ONLY the JSON array, no other text):
   }}
 ]
 
-Remember: Generate REAL questions based on the content. Do not use placeholder text.
+Remember: Generate REAL questions based on the content. Return ONLY the JSON array, nothing else.
 """
 
 def extract_text(response):
@@ -496,10 +572,11 @@ def extract_text(response):
     return ""
 
 def parse_json(text: str) -> List[Dict[str, Any]]:
-    """Parse JSON from API response with optimized parsing"""
+    """Parse JSON from API response with robust error handling and incomplete JSON recovery"""
     if not text or len(text.strip()) < 5:
         return []
     
+    original_text = text
     text = text.strip()
     
     # Remove markdown code blocks efficiently
@@ -515,6 +592,10 @@ def parse_json(text: str) -> List[Dict[str, Any]]:
         parsed = json.loads(text)
         if isinstance(parsed, list) and len(parsed) > 0:
             return parsed
+        elif isinstance(parsed, dict) and 'questions' in parsed:
+            questions = parsed.get('questions', [])
+            if isinstance(questions, list) and len(questions) > 0:
+                return questions
     except json.JSONDecodeError:
         pass
     
@@ -522,30 +603,154 @@ def parse_json(text: str) -> List[Dict[str, Any]]:
     start_idx = text.find('[')
     end_idx = text.rfind(']')
     
-    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-        try:
-            json_str = text[start_idx:end_idx+1]
-            parsed = json.loads(json_str)
-            if isinstance(parsed, list) and len(parsed) > 0:
-                return parsed
-        except json.JSONDecodeError:
-            pass
-    
-    # Last attempt: fix common JSON issues and retry
-    try:
-        # Quick check if it looks like JSON
-        if '[' in text and ']' in text and '"question"' in text:
-            # Fix common JSON issues (compiled regex for performance)
-            text = re.sub(r',\s*}', '}', text)  # Remove trailing commas
-            text = re.sub(r',\s*]', ']', text)  # Remove trailing commas before ]
-            
-            start_idx = text.find('[')
-            end_idx = text.rfind(']')
-            if start_idx != -1 and end_idx != -1:
+    if start_idx != -1:
+        # If we found start but no end, try to complete it
+        if end_idx == -1 or end_idx <= start_idx:
+            # Try to find where the last complete object ends
+            # Look for closing braces to estimate where array should end
+            brace_count = 0
+            last_brace_pos = -1
+            for i in range(start_idx, len(text)):
+                if text[i] == '{':
+                    brace_count += 1
+                elif text[i] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        last_brace_pos = i
+            # If we found complete objects, try adding closing bracket
+            if last_brace_pos > start_idx:
+                # Check if there are multiple objects (comma separated)
+                potential_json = text[start_idx:last_brace_pos+1]
+                # Count how many complete question objects we have
+                question_objects = re.findall(r'\{[^{}]*"question"[^{}]*\}', potential_json)
+                if not question_objects:
+                    # Try a more lenient approach - extract everything up to last complete brace
+                    potential_json = text[start_idx:last_brace_pos+1] + ']'
+                    try:
+                        parsed = json.loads(potential_json)
+                        if isinstance(parsed, list) and len(parsed) > 0:
+                            return parsed
+                    except:
+                        pass
+        
+        # Normal case: we have both brackets
+        if end_idx != -1 and end_idx > start_idx:
+            try:
                 json_str = text[start_idx:end_idx+1]
                 parsed = json.loads(json_str)
                 if isinstance(parsed, list) and len(parsed) > 0:
                     return parsed
+            except json.JSONDecodeError:
+                pass
+    
+    # Enhanced JSON fixing: handle more edge cases
+    try:
+        if '[' in text and ('"question"' in text or '"options"' in text):
+            fixed_text = text
+            
+            # Remove trailing commas
+            fixed_text = re.sub(r',\s*}', '}', fixed_text)
+            fixed_text = re.sub(r',\s*]', ']', fixed_text)
+            
+            # Fix newlines in strings (but preserve structure)
+            fixed_text = re.sub(r'(?<!\\)\n', '\\n', fixed_text)
+            fixed_text = re.sub(r'\r', '', fixed_text)
+            
+            # Try to extract JSON array
+            start_idx = fixed_text.find('[')
+            end_idx = fixed_text.rfind(']')
+            
+            # If no closing bracket, try to add one
+            if start_idx != -1:
+                if end_idx == -1 or end_idx <= start_idx:
+                    # Find last complete object
+                    brace_level = 0
+                    last_complete_pos = -1
+                    in_string = False
+                    escape_next = False
+                    
+                    for i in range(start_idx, len(fixed_text)):
+                        char = fixed_text[i]
+                        if escape_next:
+                            escape_next = False
+                            continue
+                        if char == '\\':
+                            escape_next = True
+                            continue
+                        if char == '"' and not escape_next:
+                            in_string = not in_string
+                            continue
+                        if not in_string:
+                            if char == '{':
+                                brace_level += 1
+                            elif char == '}':
+                                brace_level -= 1
+                                if brace_level == 0:
+                                    last_complete_pos = i
+                    
+                    if last_complete_pos > start_idx:
+                        # Extract up to last complete object and close array
+                        json_str = fixed_text[start_idx:last_complete_pos+1] + ']'
+                        try:
+                            parsed = json.loads(json_str)
+                            if isinstance(parsed, list) and len(parsed) > 0:
+                                return parsed
+                        except:
+                            pass
+                else:
+                    json_str = fixed_text[start_idx:end_idx+1]
+                    try:
+                        parsed = json.loads(json_str)
+                        if isinstance(parsed, list) and len(parsed) > 0:
+                            return parsed
+                    except json.JSONDecodeError:
+                        # Try cleaning and retrying
+                        json_str = json_str.replace('\n', ' ').replace('\t', ' ')
+                        json_str = ''.join(char if char.isprintable() or char in ['\n', '\t'] else ' ' for char in json_str)
+                        try:
+                            parsed = json.loads(json_str)
+                            if isinstance(parsed, list) and len(parsed) > 0:
+                                return parsed
+                        except:
+                            pass
+    except Exception:
+        pass
+    
+    # Last resort: extract complete question objects using regex (for truncated responses)
+    try:
+        questions = []
+        # Pattern to find complete question objects
+        # Look for { "question": "...", ... } patterns
+        pattern = r'\{\s*"question"\s*:\s*"([^"]*(?:\\.[^"]*)*)"[^}]*\}'
+        matches = re.finditer(pattern, text, re.DOTALL)
+        
+        for match in matches:
+            obj_start = match.start()
+            obj_text = match.group(0)
+            # Try to parse this object
+            try:
+                # Complete the object if needed
+                if not obj_text.strip().endswith('}'):
+                    # Try to find where object should end
+                    brace_count = obj_text.count('{') - obj_text.count('}')
+                    if brace_count > 0:
+                        # Look ahead for closing brace
+                        remaining = text[obj_start + len(obj_text):obj_start + len(obj_text) + 500]
+                        for i, char in enumerate(remaining):
+                            if char == '}':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    obj_text = text[obj_start:obj_start + len(obj_text) + i + 1]
+                                    break
+                
+                parsed_obj = json.loads(obj_text)
+                if isinstance(parsed_obj, dict) and 'question' in parsed_obj:
+                    questions.append(parsed_obj)
+            except:
+                continue
+        
+        if len(questions) > 0:
+            return questions
     except Exception:
         pass
     
