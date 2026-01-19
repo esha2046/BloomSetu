@@ -6,7 +6,7 @@ import io
 from config import API_avai, REQUEST_COOLDOWN, MIN_CONTENT_LENGTH, DAILY_LIMIT, OPTIMAL_CONTENT_LENGTH, MAX_IMAGE_SIZE_KB
 from extract import extract_pdf, extract_docx
 from question_generator import generate_questions
-from evaluate import evaluate_answer, calculate_total_score
+from evaluate import evaluate_answer, calculate_total_score, evaluate_batch
 from curriculum import BOARDS, CLASSES, ALL_SUBJECTS, QUESTION_TYPES, get_chapters, get_keywords_for_bloom
 from shared_state import save_questions, load_questions, save_student_result, load_student_history
 from auth import login_page, register_page, logout, check_auth, init_users
@@ -507,17 +507,9 @@ else:
                 use_container_width=True,
                 disabled=(answered < total_q)
             ):
-                results = []
                 with st.spinner("Evaluating your answers..."):
-                    for idx, question in enumerate(questions, 1):
-                        student_answer = st.session_state.student_answers.get(idx, "")
-                        evaluation = evaluate_answer(question, student_answer)
-                        results.append({
-                            'question_num': idx,
-                            'question': question['question'],
-                            'student_answer': student_answer,
-                            'evaluation': evaluation
-                        })
+                    # Use batch evaluation for faster processing
+                    results = evaluate_batch(questions, st.session_state.student_answers)
 
                 score_summary = calculate_total_score(results)
                 st.session_state.results = {
